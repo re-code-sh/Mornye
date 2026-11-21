@@ -143,12 +143,12 @@ class NowPlayingRoute extends PageRoute<void> {
 
   @override
   Duration get transitionDuration =>
-      morph?.duration ?? const Duration(milliseconds: 400);
+      morph?.duration ?? MotionPace.duration(const Duration(milliseconds: 400));
 
   @override
   Duration get reverseTransitionDuration => morph?.duration == Duration.zero
       ? Duration.zero
-      : const Duration(milliseconds: 300);
+      : MotionPace.duration(const Duration(milliseconds: 300));
 
   /// Moves the Material shrink on the spring of the entrance, the slow
   /// spatial one for full-screen surfaces, kept critically damped so the
@@ -208,7 +208,7 @@ class NowPlayingRoute extends PageRoute<void> {
         _dismissTarget != null &&
         (morph?.duration ?? Duration.zero) > Duration.zero;
     if (!shrinks && !_interactiveTransition) return null;
-    return _spring(_exitSpring, 0, velocity);
+    return _spring(MotionPace.spring(_exitSpring), 0, velocity);
   }
 
   Rect _openRect(Size size, double value) => Rect.lerp(
@@ -217,7 +217,10 @@ class NowPlayingRoute extends PageRoute<void> {
     morph!.curve.transform(value),
   )!;
 
+  // A touch that began before the player closed still ends afterwards.
+  // Driving a popped route would put the page back on screen for good.
   void startDrag() {
+    if (!isActive) return;
     _dragGeneration++;
     _releaseVelocity = 0;
     // A drag takes over a cancelled back gesture still settling open.
@@ -237,15 +240,18 @@ class NowPlayingRoute extends PageRoute<void> {
   }
 
   void updateDrag(DragUpdateDetails details, double pageHeight) {
+    if (!isActive) return;
     controller?.value -= (details.primaryDelta ?? 0) / pageHeight;
   }
 
   void endDrag(DragEndDetails details, double pageHeight) {
+    if (!isActive) return;
     final velocity = (details.primaryVelocity ?? 0) / pageHeight;
     final value = controller?.value ?? 1.0;
     // The finger moves down, the controller toward zero.
     _releaseVelocity = -velocity;
-    if (velocity > 1.0 || (velocity >= 0 && value < 0.7)) {
+    // Only the player itself is popped, never a route above or below it.
+    if (isCurrent && (velocity > 1.0 || (velocity >= 0 && value < 0.7))) {
       navigator?.pop();
     } else {
       _settleOpen();
@@ -253,6 +259,7 @@ class NowPlayingRoute extends PageRoute<void> {
   }
 
   void cancelDrag() {
+    if (!isActive) return;
     _releaseVelocity = 0;
     _settleOpen();
   }
@@ -280,7 +287,7 @@ class NowPlayingRoute extends PageRoute<void> {
     // to the entrance curve on release jumps away from the finger's position.
     final spring = (navigator?.context.isMornye ?? false)
         ? MornyeMotion.standardSpring
-        : M3EMotion.spatialDefault.toDescription();
+        : MotionPace.spring(M3EMotion.spatialDefault.toDescription());
     controller
         .animateWith(_spring(spring, 1, velocity))
         .whenCompleteOrCancel(settled);
@@ -378,7 +385,7 @@ class NowPlayingRoute extends PageRoute<void> {
     final navigator = this.navigator;
     if (isCurrent) {
       navigator?.pop();
-    } else {
+    } else if (isActive) {
       // Another route arrived during the gesture; the player stays open.
       _clearDismiss();
       _interactiveTransition = false;
@@ -398,6 +405,7 @@ class NowPlayingRoute extends PageRoute<void> {
     if (!_backGestureActive) return;
     _backGestureActive = false;
     navigator?.didStopUserGesture();
+    if (!isActive) return;
     final generation = _dragGeneration;
     const fallback = AppMotionSpec(
       Duration(milliseconds: 220),

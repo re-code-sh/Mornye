@@ -78,6 +78,7 @@ AppSettings _$AppSettingsFromJson(Map<String, dynamic> json) => AppSettings(
   usbDirect: json['usbDirect'] as bool? ?? false,
   usbDsdOverPcm: json['usbDsdOverPcm'] as bool? ?? false,
   usbAllowFixedVolume: json['usbAllowFixedVolume'] as bool? ?? false,
+  usbMaxSampleRate: (json['usbMaxSampleRate'] as num?)?.toInt() ?? 0,
   dapExclusive: json['dapExclusive'] as bool? ?? false,
   media3Engine: json['media3Engine'] as bool? ?? false,
   skipSilence: json['skipSilence'] as bool? ?? false,
@@ -166,6 +167,9 @@ AppSettings _$AppSettingsFromJson(Map<String, dynamic> json) => AppSettings(
   interfaceScale: json['interfaceScale'] == null
       ? 1
       : interfaceScaleFromJson(json['interfaceScale']),
+  animationSpeed: json['animationSpeed'] == null
+      ? 1
+      : animationSpeedFromJson(json['animationSpeed']),
   extensionVerificationBrowserMode:
       json['extensionVerificationBrowserMode'] as String? ?? 'in_app_first',
   locale: json['locale'] as String? ?? 'system',
@@ -294,6 +298,7 @@ Map<String, dynamic> _$AppSettingsToJson(
   'usbDirect': instance.usbDirect,
   'usbDsdOverPcm': instance.usbDsdOverPcm,
   'usbAllowFixedVolume': instance.usbAllowFixedVolume,
+  'usbMaxSampleRate': instance.usbMaxSampleRate,
   'dapExclusive': instance.dapExclusive,
   'media3Engine': instance.media3Engine,
   'skipSilence': instance.skipSilence,
@@ -354,6 +359,7 @@ Map<String, dynamic> _$AppSettingsToJson(
   'heroAnimationsEnabled': instance.heroAnimationsEnabled,
   'forceBackdropBlur': instance.forceBackdropBlur,
   'interfaceScale': instance.interfaceScale,
+  'animationSpeed': instance.animationSpeed,
   'extensionVerificationBrowserMode': instance.extensionVerificationBrowserMode,
   'locale': instance.locale,
   'lyricsMode': instance.lyricsMode,

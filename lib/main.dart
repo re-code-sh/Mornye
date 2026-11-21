@@ -38,6 +38,7 @@ import 'package:mornye/services/background_favorites.dart';
 import 'package:mornye/services/desktop_deep_links.dart';
 import 'package:mornye/services/desktop_diagnostics.dart';
 import 'package:mornye/services/desktop_library_watcher.dart';
+import 'package:mornye/services/media_kit_playback_deck.dart';
 import 'package:mornye/services/link/desktop/link_desktop_host.dart';
 import 'package:mornye/services/link/desktop/link_phone_playback.dart';
 import 'package:mornye/services/link/features/link_phone_features.dart';
@@ -53,6 +54,7 @@ import 'package:mornye/utils/desktop_platform.dart';
 import 'package:mornye/utils/android_tv.dart';
 import 'package:mornye/utils/local_library_scan_prefs.dart';
 import 'package:mornye/utils/logger.dart';
+import 'package:mornye/utils/view_display.dart';
 import 'package:mornye/widgets/desktop/desktop_commands.dart'
     show restoreDesktopSidebar;
 import 'package:mornye/widgets/desktop/desktop_inspector.dart'
@@ -122,6 +124,7 @@ void main() {
       // Desktop: log files and the unclean-exit marker, before the error
       // hooks below start writing to them.
       await DesktopDiagnostics.initialize();
+      if (isDesktopPlatform) MediaKitPlaybackDeck.releaseOutputsOnExit();
       LicenseRegistry.addLicense(() async* {
         yield LicenseEntryWithLineBreaks(
           const [AppInfo.appName],
@@ -182,13 +185,16 @@ void main() {
       final previousOnError = FlutterError.onError;
       FlutterError.onError = (details) {
         previousOnError?.call(details);
-        _log.e('Uncaught Flutter error: ${details.exceptionAsString()}');
+        _log.e(
+          'Uncaught Flutter error: ${details.exceptionAsString()}'
+          '${firstStackFrames(details.stack)}',
+        );
         unawaited(
           AppCrashService.recordRuntimeError(details.exception, details.stack),
         );
       };
       WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
-        _log.e('Uncaught platform error: $error');
+        _log.e('Uncaught platform error: $error${firstStackFrames(stack)}');
         unawaited(AppCrashService.recordRuntimeError(error, stack));
         return true;
       };
@@ -664,7 +670,7 @@ class _EagerInitializationState extends ConsumerState<EagerInitialization>
   /// 60 Hz.
   void _logRefreshRate() {
     if (!mounted) return;
-    final rate = View.maybeOf(context)?.display.refreshRate;
+    final rate = displayOf(View.maybeOf(context))?.refreshRate;
     if (rate == null || rate == _loggedRefreshRate) return;
     _loggedRefreshRate = rate;
     _log.i('Display refresh rate: ${rate.toStringAsFixed(0)} Hz');

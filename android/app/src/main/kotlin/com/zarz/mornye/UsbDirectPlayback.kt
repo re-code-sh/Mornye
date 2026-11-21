@@ -17,6 +17,7 @@ import android.os.PowerManager
 import com.mornye.backend.UsbDirectOutput
 import com.mornye.backend.UsbOutputFormat
 import com.mornye.backend.UsbHardwareVolume
+import com.mornye.backend.UsbResampler
 import io.flutter.plugin.common.MethodCall
 import java.io.FileNotFoundException
 import java.io.IOException
@@ -56,12 +57,19 @@ internal class UsbDirectPlayback(private val context: Context, private val emit:
     // app last let go of that DAC: a reopen right after is a track change.
     private val deviceVolumes = mutableMapOf<Int, Double>()
     private val deviceReleases = mutableMapOf<Int, Long>()
+    // The rate each DAC played a song rate at, so a rate it refused once is
+    // not asked of it again for every song.
+    private val deviceRates = mutableMapOf<Int, MutableMap<Int, Int>>()
     // DACs whose access prompt the user declined this session, so later
     // tracks do not prompt again. Touched on the main thread only.
     private val declinedDevices = mutableSetOf<String>()
     // A mono source sent to a stereo-only DAC, each sample on both channels.
     private var upmixMono = false
     private var upmixBuffer: ByteBuffer? = null
+    // Set while the DAC plays another rate than the song's, which it refused.
+    private var resampler: UsbResampler? = null
+    private var resamplerDrained = false
+    private var resampleInput = ByteArray(0)
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -73,6 +81,7 @@ internal class UsbDirectPlayback(private val context: Context, private val emit:
                 worker.post {
                     deviceVolumes.remove(device.deviceId)
                     deviceReleases.remove(device.deviceId)
+                    deviceRates.remove(device.deviceId)
                     if (device.deviceId == deviceId) fail("USB disconnected")
                 }
             } else if (intent.action == permissionAction) {
@@ -283,22 +292,46 @@ internal class UsbDirectPlayback(private val context: Context, private val emit:
                 }
                 var opened: UsbDirectOutput? = null
                 var refused: Exception? = null
-                for ((outChannels, outBits) in attempts) {
-                    try {
-                        opened = UsbDirectOutput.open(usb.fileDescriptor, descriptors, rate.toUInt(), outChannels.toUByte(), outBits.toUByte(), isDsd, allowDop)
-                        requestedBits = outBits
-                        upmixMono = outChannels != channels
-                        break
-                    } catch (error: Exception) {
-                        // The format check fails before libusb touches the device.
-                        if (error.message?.startsWith("No compatible USB format") != true) throw error
-                        if (refused == null) refused = error
+                // A DAC that refuses the song's rate, or a song above the rate
+                // the user allows, is converted to a rate the DAC takes. DSD
+                // is never converted.
+                val maxRate = request.call.argument<Int>("maxSampleRate") ?: 0
+                val playedRates = deviceRates.getOrPut(request.device.deviceId) { mutableMapOf() }
+                val rates = if (isDsd) listOf(rate) else UsbDirectFormats.outputRates(rate, maxRate, playedRates[rate])
+                var deviceRefusals = 0
+                rates@ for (outRate in rates) {
+                    for ((outChannels, outBits) in attempts) {
+                        try {
+                            opened = UsbDirectOutput.open(usb.fileDescriptor, descriptors, outRate.toUInt(), outChannels.toUByte(), outBits.toUByte(), isDsd, allowDop)
+                            requestedBits = outBits
+                            upmixMono = outChannels != channels
+                            break@rates
+                        } catch (error: Exception) {
+                            if (UsbDirectFormats.classifyOutput(error.message) != UsbDirectFormats.DAC_FORMAT) throw error
+                            if (refused == null) refused = error
+                            val message = error.message.orEmpty()
+                            // Refusals that never set anything on the DAC are
+                            // free; one the DAC itself gave ends this rate.
+                            if (message.startsWith("USB clock does not offer")) continue@rates
+                            if (!message.startsWith("No compatible USB format") &&
+                                !message.contains("bandwidth too small")) {
+                                if (++deviceRefusals == 4) break@rates
+                                continue@rates
+                            }
+                        }
                     }
                 }
                 // The first refusal names the format the song asked for.
                 val audio = opened ?: throw requireNotNull(refused)
                 output = audio
                 format = audio.format()
+                val outputRate = audio.format().sampleRate
+                if (!isDsd) playedRates[rate] = outputRate.toInt()
+                if (!isDsd && outputRate.toInt() != rate) {
+                    resampler = UsbResampler.create(rate.toUInt(), outputRate, channels.toUByte(),
+                        audio.format().subslot, audio.format().bits)
+                    android.util.Log.i("UsbDirect", "Converting $rate Hz to $outputRate Hz for the DAC")
+                }
                 // What the DAC read when it was opened, for the log: a level
                 // that falls between tracks was set by something else.
                 val connected = audio.volume()
@@ -333,6 +366,7 @@ internal class UsbDirectPlayback(private val context: Context, private val emit:
                     "codec" to source.codec, "lossy" to source.lossy,
                     "duration" to durationUs / 1000,
                     "transport" to f.encoding, "carrierRate" to f.sampleRate.toLong(), "driver" to "usb_direct",
+                    "resampled" to (resampler != null),
                     "volume" to volumeMap(audio.volume()), "volumeTrace" to volumeTrace,
                     "volumeBlocked" to (!audio.volume().available && !allowFixedVolume)), null)
             } catch (error: Exception) {
@@ -352,7 +386,8 @@ internal class UsbDirectPlayback(private val context: Context, private val emit:
             if (data == null) ended = true else pending = ByteBuffer.wrap(data)
         } else {
             pending = try {
-                val data = requireNotNull(pcm).read(f.subslot.toInt() * 8)
+                val source = requireNotNull(pcm)
+                val data = resampled(source.read(f.subslot.toInt() * 8), source.ended)
                 if (upmixMono && data != null) {
                     BitPerfectPcm.duplicateMono(data, f.subslot.toInt(), upmixBuffer).also { upmixBuffer = it }
                 } else data
@@ -363,6 +398,26 @@ internal class UsbDirectPlayback(private val context: Context, private val emit:
             }
             ended = requireNotNull(pcm).ended
         }
+    }
+
+    /**
+     * [data] at the rate the DAC plays, when that is not the song's. With
+     * [last], what the filter still holds follows. Null when the filter
+     * needs more input before its next frame.
+     */
+    private fun resampled(data: ByteBuffer?, last: Boolean): ByteBuffer? {
+        val converter = resampler ?: return data
+        var output = ByteArray(0)
+        if (data != null && data.hasRemaining()) {
+            if (resampleInput.size != data.remaining()) resampleInput = ByteArray(data.remaining())
+            data.duplicate().get(resampleInput)
+            output = converter.process(resampleInput)
+        }
+        if (last && !resamplerDrained) {
+            resamplerDrained = true
+            output += converter.finish()
+        }
+        return if (output.isEmpty()) null else ByteBuffer.wrap(output)
     }
 
     private fun resume() {
@@ -446,6 +501,8 @@ internal class UsbDirectPlayback(private val context: Context, private val emit:
         val f = requireNotNull(format)
         val target = positionUs.coerceIn(0, durationUs.coerceAtLeast(0))
         baseUs = dsd?.seek(target, f.encoding) ?: target.also { pcm?.seek(it) }
+        resampler?.reset()
+        resamplerDrained = false
         pending = null
         writtenFrames = 0
         ended = false
@@ -487,6 +544,9 @@ internal class UsbDirectPlayback(private val context: Context, private val emit:
         dsd = null
         format = null
         pending = null
+        resampler?.destroy()
+        resampler = null
+        resamplerDrained = false
         upmixMono = false
         ended = false
         failed = false

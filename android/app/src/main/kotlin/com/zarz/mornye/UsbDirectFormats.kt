@@ -70,6 +70,35 @@ internal object UsbDirectFormats {
         else -> type.removePrefix("audio/").removePrefix("x-").uppercase()
     }
 
+    private val standardRates = listOf(44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000)
+
+    private fun isCdFamily(rate: Int) = rate % 11025 == 0
+
+    /**
+     * The rates to convert a song to when the DAC refuses its own [rate],
+     * best first. Lower rates come first, those of the song's own family
+     * (44.1 or 48 kHz) ahead of the rest because they convert by a whole
+     * ratio; then the higher rates from the nearest up, since a DAC without
+     * 44.1 kHz nearly always has 48 kHz.
+     */
+    fun resampleRates(rate: Int): List<Int> {
+        val family = isCdFamily(rate)
+        val lower = standardRates.filter { it < rate }
+            .sortedWith(compareBy({ isCdFamily(it) != family }, { -it }))
+        return lower + standardRates.filter { it > rate }
+    }
+
+    /**
+     * The rates to open the DAC at for a song at [rate], in order: the one
+     * the DAC played this rate at before ([played]), the song's own, then
+     * [resampleRates]. A [limit] above zero leaves out every rate past it,
+     * for a DAC that takes a high rate and then plays silence.
+     */
+    fun outputRates(rate: Int, limit: Int = 0, played: Int? = null): List<Int> {
+        val rates = (listOfNotNull(played) + rate + resampleRates(rate)).distinct()
+        return rates.filter { limit <= 0 || it <= limit }.ifEmpty { rates }
+    }
+
     /**
      * Maps a Rust transport or Android device error to a reason. Unknown
      * messages stay [UNSUPPORTED]; the log keeps the original text.
@@ -82,6 +111,9 @@ internal object UsbDirectFormats {
         }
         return when {
             text.startsWith("No compatible USB format") ||
+                text.startsWith("USB clock does not offer") ||
+                // The endpoint is too small for this rate; a lower one fits.
+                text.contains("bandwidth too small") ||
                 text.contains("clock rate could not be verified") ||
                 text.contains("Variable USB clock has no rate control") -> DAC_FORMAT
             text.startsWith("Cannot open USB device") ||
@@ -89,7 +121,7 @@ internal object UsbDirectFormats {
                 text.startsWith("USB disconnected") -> DAC_OPEN
             listOf(
                 "Implicit feedback", "bus speed", "packet interval", "interval/packet size",
-                "bandwidth too small", "feedback endpoint", "Multiple USB configurations",
+                "feedback endpoint", "Multiple USB configurations",
                 "malformed USB descriptor", "No supported USB endpoint", "Short USB control response",
                 "USB transfer allocation failed", "USB clock selector", "USB clock topology",
             ).any { text.contains(it) } -> DAC_UNSUPPORTED
