@@ -219,7 +219,12 @@ jobs:
           cp "$apk_dir/app-arm64-v8a-release.apk" test-apks/Mornye-Test-arm64.apk
           cp "$apk_dir/app-armeabi-v7a-release.apk" test-apks/Mornye-Test-arm32.apk
 
-          for apk in test-apks/Mornye-Test-arm64.apk test-apks/Mornye-Test-arm32.apk; do
+          # Gradle's ABI split adds abiCode * 1000 to the base versionCode
+          # (arm64-v8a is 2, armeabi-v7a is 1), so the arm64 APK carries
+          # VERSION_CODE + 2000 and the arm32 APK VERSION_CODE + 1000.
+          for spec in "Mornye-Test-arm64.apk:2000" "Mornye-Test-arm32.apk:1000"; do
+            apk="test-apks/${spec%%:*}"
+            abi_offset="${spec##*:}"
             package="$("$aapt2" dump packagename "$apk")"
             if [ "$package" != "com.zarz.mornye.test" ]; then
               echo "ERROR: $apk has package $package, expected com.zarz.mornye.test" >&2
@@ -232,8 +237,9 @@ jobs:
                 echo "ERROR: $apk versionName is not $VERSION_NAME" >&2
                 exit 1
               }
-              echo "$badging" | grep -q "versionCode='$VERSION_CODE'" || {
-                echo "ERROR: $apk versionCode is not $VERSION_CODE" >&2
+              expected_code=$((VERSION_CODE + abi_offset))
+              echo "$badging" | grep -q "versionCode='$expected_code'" || {
+                echo "ERROR: $apk versionCode is not $expected_code" >&2
                 exit 1
               }
             fi
