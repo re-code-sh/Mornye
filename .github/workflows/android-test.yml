@@ -1,17 +1,26 @@
 name: Android Test Build
 
-# Quick Android-only test build. Unlike Release, this never creates a
-# GitHub release and builds no other platform. The APKs get the package
-# name com.zarz.mornye.test and the launcher label "Mornye Test", so they
-# install next to the normal Mornye app instead of replacing it, with
-# their own separate app data.
+# Quick Android-only test build. Unlike Release, this builds no other
+# platform. The APKs get the package name com.zarz.mornye.test and the
+# launcher label "Mornye Test", so they install next to the normal Mornye
+# app instead of replacing it, with their own separate app data.
 #
 # The build is Lite (no Discord SDK) and signed with the debug key that
 # Gradle falls back to when no key.properties exists, so it needs no
 # repository secrets and can be installed directly for testing.
+#
+# Run it by hand for a test build, or push a version tag (for example
+# v5.4.0) to also publish the APKs on that tag's GitHub release, as a
+# draft to review before it goes out:
+#
+#   git tag v5.4.0
+#   git push origin v5.4.0
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
@@ -19,6 +28,8 @@ permissions:
 jobs:
   build-android-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       MORNYE_DISCORD_SDK: "0"
 
@@ -159,4 +170,21 @@ jobs:
           retention-days: 14
           path: |
             test-apks/Mornye-Test-*.apk
+            test-apks/SHA256SUMS.txt
+
+      # Only on a tag push: publish the APKs on the tag's GitHub release.
+      # The release stays a draft until it is published from the Releases
+      # page. To publish releases right away instead, drop --draft.
+      - name: Create draft release and upload APKs
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "Test build for ${{ github.ref_name }} (commit ${{ github.sha }}). Same Lite test APKs as the Android Test Build: package com.zarz.mornye.test, installs next to the normal Mornye app." \
+            --draft \
+            test-apks/Mornye-Test-arm64.apk \
+            test-apks/Mornye-Test-arm32.apk \
             test-apks/SHA256SUMS.txt
