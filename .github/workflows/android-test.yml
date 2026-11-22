@@ -5,16 +5,23 @@ name: Android Test Build
 # launcher label "Mornye Test", so they install next to the normal Mornye
 # app instead of replacing it, with their own separate app data.
 #
-# The build is Lite (no Discord SDK) and signed with the debug key that
-# Gradle falls back to when no key.properties exists, so it needs no
-# repository secrets and can be installed directly for testing.
+# The build is Lite (no Discord SDK). When the TEST_KEYSTORE_* repository
+# secrets are set, the APKs are signed with that stable test keystore, so
+# an update installs over the previous test build instead of requiring an
+# uninstall. Without the secrets the build falls back to Gradle's debug
+# key (a fresh key on every runner, so updates then need an uninstall).
+# Switching to the stable keystore needs one last uninstall of the build
+# signed with the old key.
 #
-# Run it by hand for a test build, or push a version tag (for example
-# v5.4.0) to also publish the APKs on that tag's GitHub release, as a
-# draft to review before it goes out:
+# Run it by hand for a test build, or push a version tag to also publish
+# the APKs on that tag's GitHub release, as a draft to review before it
+# goes out. Tags follow the fork scheme v<upstream-version>.0.<n> (for
+# example v5.4.0.0.1); the tag also becomes the APK's version
+# (versionName 5.4.0.0.1, versionCode 5040001). Manual runs keep the
+# version from pubspec.yaml.
 #
-#   git tag v5.4.0
-#   git push origin v5.4.0
+#   git tag v5.4.0.0.1
+#   git push origin v5.4.0.0.1
 
 on:
   workflow_dispatch:
@@ -136,9 +143,70 @@ jobs:
             exit 1
           }
 
+      # Sign with the stable test keystore when its secrets are set, so
+      # every test APK carries the same signature. Without the secrets
+      # the build falls back to Gradle's debug key.
+      - name: Set up test signing keystore
+        env:
+          TEST_KEYSTORE_BASE64: ${{ secrets.TEST_KEYSTORE_BASE64 }}
+          TEST_KEYSTORE_PASSWORD: ${{ secrets.TEST_KEYSTORE_PASSWORD }}
+          TEST_KEY_ALIAS: ${{ secrets.TEST_KEY_ALIAS }}
+          TEST_KEY_PASSWORD: ${{ secrets.TEST_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TEST_KEYSTORE_BASE64" ]; then
+            echo "No test keystore secret set; the build will use Gradle's debug key." >&2
+            exit 0
+          fi
+          printf '%s' "$TEST_KEYSTORE_BASE64" | base64 -d > android/mornye-test.keystore
+          cat > android/key.properties <<EOF
+          storeFile=$GITHUB_WORKSPACE/android/mornye-test.keystore
+          storePassword=$TEST_KEYSTORE_PASSWORD
+          keyAlias=$TEST_KEY_ALIAS
+          keyPassword=$TEST_KEY_PASSWORD
+          EOF
+          echo "Test keystore configured."
+
+      # On a tag push, take the version from the tag so the APK itself
+      # carries the fork version (for example v5.4.0.0.1 -> versionName
+      # 5.4.0.0.1, versionCode 5040001). Tags must match
+      # v<major>.<minor>.<patch>.0.<n>; anything else fails here with a
+      # clear error instead of halfway through the build. Manual runs
+      # keep the version from pubspec.yaml.
+      - name: Derive version from tag
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref_type }}" != "tag" ]]; then
+            echo "Manual run; keeping the version from pubspec.yaml."
+            exit 0
+          fi
+          tag="${{ github.ref_name }}"
+          if [[ ! "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)\.0\.([0-9]+)$ ]]; then
+            echo "ERROR: tag '$tag' must match v<major>.<minor>.<patch>.0.<n> (for example v5.4.0.0.1)." >&2
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+          n="${BASH_REMATCH[4]}"
+          if (( n >= 100 )); then
+            echo "ERROR: fork counter in tag '$tag' must be below 100." >&2
+            exit 1
+          fi
+          version_name="$major.$minor.$patch.0.$n"
+          version_code=$((major * 1000000 + minor * 10000 + patch * 100 + n))
+          echo "VERSION_NAME=$version_name" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$version_code" >> "$GITHUB_ENV"
+          echo "Tag $tag -> versionName $version_name, versionCode $version_code"
+
       - name: Build test APKs (arm64 and arm32)
         run: |
-          bash scripts/build_android.sh --lite --target lib/main.dart
+          set -euo pipefail
+          build_args=()
+          if [ -n "${VERSION_NAME:-}" ]; then
+            build_args+=(--build-name "$VERSION_NAME" --build-number "$VERSION_CODE")
+          fi
+          bash scripts/build_android.sh --lite --target lib/main.dart ${build_args[@]+"${build_args[@]}"}
           ls -la build/app/outputs/flutter-apk/
 
       - name: Verify and collect test APKs
@@ -158,6 +226,19 @@ jobs:
               exit 1
             fi
             "$aapt2" dump badging "$apk" | grep -E "^package:|^application-label:"
+            if [ -n "${VERSION_NAME:-}" ]; then
+              badging="$("$aapt2" dump badging "$apk")"
+              echo "$badging" | grep -q "versionName='$VERSION_NAME'" || {
+                echo "ERROR: $apk versionName is not $VERSION_NAME" >&2
+                exit 1
+              }
+              echo "$badging" | grep -q "versionCode='$VERSION_CODE'" || {
+                echo "ERROR: $apk versionCode is not $VERSION_CODE" >&2
+                exit 1
+              }
+            fi
+            echo "Signing certificate for $apk:"
+            keytool -printcert -jarfile "$apk" 2>/dev/null | grep -i "SHA256" || true
           done
 
           (cd test-apks && sha256sum Mornye-Test-*.apk > SHA256SUMS.txt)
